@@ -3,12 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
+from .active_inference import AIFObservation, AIFPriors, ActiveInferenceController
 from .perception import CoreKnowledgePerceptor, SceneObservation
-from .planner import MODEL_PARAMS, cem_plan
 
 
 def _sigmoid(x: float) -> float:
@@ -69,6 +67,9 @@ class AgentDiagnostics:
     number_prior: float
     numerosity_mean: float
     number_surprise: float
+    policy_entropy: float
+    state_entropy: float
+    mean_offset: float
 
 
 class CorePriorActiveInferenceAgent:
@@ -82,6 +83,7 @@ class CorePriorActiveInferenceAgent:
         iterations: int = 4,
     ) -> None:
         self.perceptor = CoreKnowledgePerceptor()
+
         self.horizon = horizon
         self.num_samples = num_samples
         self.elite_fraction = elite_fraction
@@ -93,13 +95,21 @@ class CorePriorActiveInferenceAgent:
         self.positive_action = _find_action_index(action_meanings, ("RIGHT", "UP"), self.noop_action)
         self.has_fire_action = any(name.upper() == "FIRE" for name in action_meanings)
 
-        self.seed = seed
-        self.jax_key = jax.random.PRNGKey(seed)
-        self.params = MODEL_PARAMS
+        has_lr = any(name.upper() == "LEFT" for name in action_meanings) and any(name.upper() == "RIGHT" for name in action_meanings)
+        has_ud = any(name.upper() == "UP" for name in action_meanings) and any(name.upper() == "DOWN" for name in action_meanings)
+        if has_lr:
+            self.preferred_axis = 0
+        elif has_ud:
+            self.preferred_axis = 1
+        else:
+            self.preferred_axis = 0
 
+        self.seed = seed
         self.match_distance = 26.0
         self.max_stale = 14
         self.boundary_margin = 8.0
+
+        self.aif = ActiveInferenceController(horizon=max(3, min(5, horizon)))
 
         self.reset()
 
@@ -108,7 +118,7 @@ class CorePriorActiveInferenceAgent:
         self.next_object_id = 1
         self.control_object_id: int | None = None
         self.target_object_id: int | None = None
-        self.control_axis = 0
+        self.control_axis = self.preferred_axis
         self.last_action_code = 0.0
         self.frames_without_target = 0
         self.need_fire = self.has_fire_action
@@ -120,8 +130,11 @@ class CorePriorActiveInferenceAgent:
         self.object_error_ema = 5.0
         self.goal_progress_ema = 0.0
         self.prev_intercept_error: float | None = None
+        self.prev_intercept_x: float | None = None
         self.geometry_hits = np.zeros((2, 2), dtype=np.float32)
         self.geometry_observations = np.ones((2, 2), dtype=np.float32)
+        self.object_files: dict[int, int] = {}
+
         self.last_spelke = SpelkePriors(
             object_cohesion=0.5,
             agent_intent=0.5,
@@ -130,6 +143,8 @@ class CorePriorActiveInferenceAgent:
             numerosity_mean=1.0,
             number_surprise=0.0,
         )
+
+        self.aif.reset()
 
     def _update_lives(self, info: dict[str, Any]) -> None:
         if "lives" not in info:
@@ -141,6 +156,9 @@ class CorePriorActiveInferenceAgent:
         if lives < self.prev_lives:
             self.need_fire = True
             self.frames_without_target = 0
+            self.prev_intercept_x = None
+            self.prev_intercept_error = None
+            self.aif.reset()
         self.prev_lives = lives
 
     def _spawn_object(self, centroid: np.ndarray, area: float, color: np.ndarray, motion: float) -> None:
@@ -291,27 +309,43 @@ class CorePriorActiveInferenceAgent:
             self.target_object_id = None
             return
 
+        prev_control = self.control_object_id
         best_control_score = -1e9
         control_id = None
+        control_scores: dict[int, float] = {}
         for obj_id, obj in self.objects.items():
             action_signal = float(np.linalg.norm(obj.action_alignment))
             usage = float(obj.action_usage)
             stability = min(obj.age, 60) * 0.015
             score = action_signal * (0.6 + 0.4 * usage) - 0.45 * obj.passive_speed - 0.08 * obj.uncertainty + stability
+            control_scores[obj_id] = score
             if score > best_control_score:
                 best_control_score = score
                 control_id = obj_id
 
         if control_id is None:
             control_id = max(self.objects.keys(), key=lambda obj_id: self.objects[obj_id].area)
+        if prev_control is not None and prev_control in control_scores:
+            if control_scores[prev_control] + 0.12 >= best_control_score:
+                control_id = prev_control
         self.control_object_id = control_id
 
         control = self.objects[control_id]
         if float(np.linalg.norm(control.action_alignment)) > 1e-4:
-            self.control_axis = int(np.argmax(np.abs(control.action_alignment)))
+            proposed_axis = int(np.argmax(np.abs(control.action_alignment)))
+            current_strength = float(abs(control.action_alignment[self.control_axis]))
+            proposed_strength = float(abs(control.action_alignment[proposed_axis]))
+            if proposed_axis == self.control_axis:
+                pass
+            elif proposed_strength > 1.35 * (current_strength + 1e-5):
+                self.control_axis = proposed_axis
+        if self.preferred_axis in (0, 1):
+            self.control_axis = self.preferred_axis
 
+        prev_target = self.target_object_id
         best_target_score = -1e9
         target_id = None
+        target_scores: dict[int, float] = {}
         for obj_id, obj in self.objects.items():
             if obj_id == control_id:
                 continue
@@ -319,9 +353,14 @@ class CorePriorActiveInferenceAgent:
             compactness = 1.0 / (1.0 + np.sqrt(max(obj.area, 1.0)))
             persistence = min(obj.age, 50) * 0.01
             score = 0.72 * speed + 0.25 * obj.mean_motion + 0.9 * compactness + persistence - 0.1 * obj.uncertainty
+            target_scores[obj_id] = score
             if score > best_target_score:
                 best_target_score = score
                 target_id = obj_id
+
+        if prev_target is not None and prev_target in target_scores and target_id is not None:
+            if target_scores[prev_target] + 0.10 >= best_target_score:
+                target_id = prev_target
 
         self.target_object_id = target_id
         if self.target_object_id is None:
@@ -329,97 +368,7 @@ class CorePriorActiveInferenceAgent:
         else:
             self.frames_without_target = 0
 
-    def _current_intercept_error(self, scene: SceneObservation) -> float | None:
-        control_id = self.control_object_id
-        target_id = self.target_object_id
-        if control_id is None or target_id is None:
-            return None
-        if control_id not in self.objects or target_id not in self.objects:
-            return None
-
-        control = self.objects[control_id]
-        target = self.objects[target_id]
-        h, w = scene.frame_shape
-        x_extent = float(w - 1) if self.control_axis == 0 else float(h - 1)
-
-        target_pos = _canonical(target.position, self.control_axis)
-        target_vel = _canonical(target.velocity, self.control_axis)
-        agent_pos = _canonical(control.position, self.control_axis)
-
-        rel = agent_pos[1] - target_pos[1]
-        approaching = np.sign(rel) * target_vel[1] > 0.0
-        if approaching and abs(float(target_vel[1])) > 1e-4:
-            time_to_agent = max(float(rel / (target_vel[1] + 1e-4)), 0.0)
-        else:
-            time_to_agent = 0.0
-
-        intercept_x = float(np.clip(target_pos[0] + target_vel[0] * time_to_agent, 0.0, x_extent))
-        return abs(float(agent_pos[0]) - intercept_x)
-
-    def _update_spelke_cores(self, scene: SceneObservation) -> SpelkePriors:
-        object_cohesion = float(np.clip(np.exp(-self.object_error_ema / 8.0), 0.0, 1.0))
-
-        control_id = self.control_object_id
-        dynamic_count = 0
-        for obj_id, obj in self.objects.items():
-            if obj_id == control_id:
-                continue
-            speed = float(np.linalg.norm(obj.velocity))
-            if speed > 0.45 and obj.stale == 0:
-                dynamic_count += 1
-
-        alpha = 0.10
-        prev_mean = self.number_mean
-        self.number_mean = (1.0 - alpha) * self.number_mean + alpha * float(dynamic_count)
-        prediction_error = float(dynamic_count) - prev_mean
-        self.number_var = (1.0 - alpha) * self.number_var + alpha * prediction_error * prediction_error
-        self.number_var = float(np.clip(self.number_var, 0.05, 16.0))
-
-        number_surprise = abs(float(dynamic_count) - self.number_mean) / float(np.sqrt(self.number_var + 1e-6))
-        number_stability = float(np.clip(np.exp(-0.5 * number_surprise * number_surprise), 0.0, 1.0))
-
-        boundary_conf = (self.geometry_hits + 0.5) / (self.geometry_observations + 1.0)
-        boundary_confidence = float(np.clip(boundary_conf.mean(), 0.0, 1.0))
-        structure_confidence = float(np.clip(1.0 - abs(scene.foreground_ratio - 0.12) * 4.0, 0.0, 1.0))
-        geometry_confidence = float(np.clip(0.4 * boundary_confidence + 0.6 * structure_confidence, 0.05, 1.0))
-
-        if control_id is not None and control_id in self.objects:
-            control = self.objects[control_id]
-            action_signal = float(abs(control.action_alignment[self.control_axis]))
-            usage = float(control.action_usage)
-            intercept_error = self._current_intercept_error(scene)
-            if intercept_error is None:
-                progress = 0.0
-                self.prev_intercept_error = None
-            else:
-                if self.prev_intercept_error is None:
-                    progress = 0.0
-                else:
-                    progress = self.prev_intercept_error - intercept_error
-                self.prev_intercept_error = intercept_error
-            self.goal_progress_ema = 0.9 * self.goal_progress_ema + 0.1 * progress
-            agent_intent = _sigmoid(1.4 * action_signal + 1.0 * usage + 0.8 * self.goal_progress_ema - 0.15 * control.uncertainty)
-        else:
-            self.goal_progress_ema = 0.92 * self.goal_progress_ema
-            self.prev_intercept_error = None
-            agent_intent = 0.25
-
-        spelke = SpelkePriors(
-            object_cohesion=object_cohesion,
-            agent_intent=float(np.clip(agent_intent, 0.0, 1.0)),
-            geometry_confidence=geometry_confidence,
-            number_stability=number_stability,
-            numerosity_mean=float(self.number_mean),
-            number_surprise=float(number_surprise),
-        )
-        self.last_spelke = spelke
-        return spelke
-
-    def _dynamic_planner_params(
-        self,
-        scene: SceneObservation,
-        spelke: SpelkePriors,
-    ) -> tuple[np.ndarray, dict[str, jnp.float32]] | None:
+    def _planner_observation(self, scene: SceneObservation) -> tuple[AIFObservation, float] | None:
         control_id = self.control_object_id
         target_id = self.target_object_id
         if control_id is None or target_id is None:
@@ -438,65 +387,121 @@ class CorePriorActiveInferenceAgent:
         target_vel = _canonical(target.velocity, self.control_axis)
         agent_pos = _canonical(control.position, self.control_axis)
 
-        state = np.array(
-            [
-                target_pos[0],
-                target_pos[1],
-                target_vel[0],
-                target_vel[1],
-                agent_pos[0],
-                agent_pos[1],
-                np.clip(0.5 * (target.uncertainty + control.uncertainty), 0.08, 6.0),
-            ],
-            dtype=np.float32,
-        )
+        rel_y = float(agent_pos[1] - target_pos[1])
+        approaching = float(np.sign(rel_y) * target_vel[1]) > 0.0
+        if approaching and abs(float(target_vel[1])) > 1e-4:
+            time_to_agent = max(float(rel_y / (target_vel[1] + 1e-4)), 0.0)
+        else:
+            time_to_agent = 0.0
 
-        action_signal = float(abs(control.action_alignment[self.control_axis]))
-        agent_speed = float(np.clip(1.0 + 2.2 * action_signal, 1.0, 4.5))
+        intercept_x = float(np.clip(target_pos[0] + target_vel[0] * time_to_agent, 0.0, x_extent))
+        relative_offset = float(agent_pos[0] - intercept_x)
+        intercept_error = abs(relative_offset)
+
+        if self.prev_intercept_x is None:
+            intercept_drift = float(target_vel[0])
+        else:
+            intercept_drift = float(intercept_x - self.prev_intercept_x)
+        intercept_drift = float(np.clip(intercept_drift, -12.0, 12.0))
+        self.prev_intercept_x = intercept_x
+
+        action_usage = max(float(control.action_usage), 0.03)
+        alignment = float(abs(control.action_alignment[self.control_axis]))
+        estimated_gain = alignment / action_usage
+        action_effect = float(np.clip(1.0 + 1.1 * estimated_gain, 1.0, 3.5))
+
         agent_extent = float(np.clip(2.0 + 0.78 * np.sqrt(max(control.area, 1.0)), 4.0, 20.0))
-        contact_band = float(np.clip(0.45 * agent_extent, 2.0, 10.0))
-        boundary_margin = float(np.clip(1.55 * agent_extent, 6.0, 26.0))
-        goal_scale = float(np.clip(0.20 * x_extent, 12.0, 48.0))
-        intercept_temp = float(np.clip(0.65 * goal_scale, 8.0, 26.0))
-
         protected_boundary = y_extent if agent_pos[1] >= 0.5 * y_extent else 0.0
+        protected_distance = abs(protected_boundary - float(target_pos[1]))
+        near_protected = float(np.clip((1.6 * agent_extent - protected_distance) / (1.6 * agent_extent + 1e-6), 0.0, 1.0))
+        miss_risk = float(near_protected * np.clip(intercept_error / (agent_extent + 1e-6), 0.0, 2.0))
 
-        object_weight = float(np.clip(0.4 + 1.6 * spelke.object_cohesion, 0.4, 2.4))
-        agent_weight = float(np.clip(0.5 + 1.8 * spelke.agent_intent, 0.5, 2.8))
-        number_weight = float(
-            np.clip(
-                1.0 + 0.45 * max(spelke.numerosity_mean - 1.0, 0.0) + 0.25 * spelke.number_surprise,
-                1.0,
-                3.0,
-            )
-        )
-        wall_penalty = float(np.clip(0.15 + 1.0 * spelke.geometry_confidence, 0.15, 1.4))
-        wall_margin = float(np.clip(0.65 * agent_extent + 4.0, 4.0, 22.0))
-
-        params = dict(MODEL_PARAMS)
-        params.update(
-            {
-                "x_min": jnp.float32(0.0),
-                "x_max": jnp.float32(x_extent),
-                "y_min": jnp.float32(0.0),
-                "y_max": jnp.float32(y_extent),
-                "agent_speed": jnp.float32(agent_speed),
-                "agent_extent": jnp.float32(agent_extent),
-                "contact_band": jnp.float32(contact_band),
-                "protected_boundary": jnp.float32(protected_boundary),
-                "boundary_margin": jnp.float32(boundary_margin),
-                "goal_scale": jnp.float32(goal_scale),
-                "intercept_temperature": jnp.float32(intercept_temp),
-                "object_weight": jnp.float32(object_weight),
-                "agent_weight": jnp.float32(agent_weight),
-                "number_weight": jnp.float32(number_weight),
-                "geometry_confidence": jnp.float32(spelke.geometry_confidence),
-                "wall_margin": jnp.float32(wall_margin),
-                "wall_penalty": jnp.float32(wall_penalty),
-            }
+        return (
+            AIFObservation(
+                relative_offset=relative_offset,
+                approaching=approaching,
+                miss_risk=miss_risk,
+                action_effect=action_effect,
+                intercept_drift=intercept_drift,
+            ),
+            intercept_error,
         )
 
-        return state, params
+    def _update_object_files(self, dynamic_ids: list[int]) -> int:
+        for obj_id in list(self.object_files):
+            self.object_files[obj_id] -= 1
+            if self.object_files[obj_id] <= 0:
+                del self.object_files[obj_id]
+
+        for obj_id in dynamic_ids[:4]:
+            self.object_files[obj_id] = 8
+
+        return len(self.object_files)
+
+    def _update_spelke_cores(self, scene: SceneObservation, intercept_error: float | None) -> SpelkePriors:
+        permanence = float(np.exp(-self.frames_without_target / 20.0))
+        object_cohesion = float(np.clip(np.exp(-self.object_error_ema / 8.0) * (0.75 + 0.25 * permanence), 0.0, 1.0))
+
+        control_id = self.control_object_id
+        dynamic_ids: list[int] = []
+        for obj_id, obj in self.objects.items():
+            if obj_id == control_id:
+                continue
+            speed = float(np.linalg.norm(obj.velocity))
+            if speed > 0.45 and obj.stale == 0:
+                dynamic_ids.append(obj_id)
+
+        dynamic_count = len(dynamic_ids)
+        exact_object_files = self._update_object_files(dynamic_ids)
+        approx_numerosity = 0.65 * float(exact_object_files) + 0.35 * float(dynamic_count)
+
+        alpha = 0.10
+        prev_mean = self.number_mean
+        self.number_mean = (1.0 - alpha) * self.number_mean + alpha * approx_numerosity
+        prediction_error = approx_numerosity - prev_mean
+        self.number_var = (1.0 - alpha) * self.number_var + alpha * prediction_error * prediction_error
+        self.number_var = float(np.clip(self.number_var, 0.05, 16.0))
+
+        number_surprise = abs(approx_numerosity - self.number_mean) / float(np.sqrt(self.number_var + 1e-6))
+        number_stability = float(np.clip(np.exp(-0.5 * number_surprise * number_surprise), 0.0, 1.0))
+
+        boundary_conf = (self.geometry_hits + 0.5) / (self.geometry_observations + 1.0)
+        boundary_confidence = float(np.clip(boundary_conf.mean(), 0.0, 1.0))
+        structure_confidence = float(np.clip(1.0 - abs(scene.foreground_ratio - 0.12) * 4.0, 0.0, 1.0))
+        geometry_confidence = float(np.clip(0.5 * boundary_confidence + 0.5 * structure_confidence, 0.05, 1.0))
+
+        if control_id is not None and control_id in self.objects:
+            control = self.objects[control_id]
+            action_signal = float(abs(control.action_alignment[self.control_axis]))
+            usage = float(control.action_usage)
+
+            if intercept_error is None:
+                progress = 0.0
+                self.prev_intercept_error = None
+            else:
+                if self.prev_intercept_error is None:
+                    progress = 0.0
+                else:
+                    progress = self.prev_intercept_error - intercept_error
+                self.prev_intercept_error = intercept_error
+
+            self.goal_progress_ema = 0.9 * self.goal_progress_ema + 0.1 * progress
+            agent_intent = _sigmoid(1.6 * action_signal + 1.2 * usage + 1.0 * self.goal_progress_ema - 0.15 * control.uncertainty)
+        else:
+            self.goal_progress_ema = 0.92 * self.goal_progress_ema
+            self.prev_intercept_error = None
+            agent_intent = 0.25
+
+        spelke = SpelkePriors(
+            object_cohesion=object_cohesion,
+            agent_intent=float(np.clip(agent_intent, 0.0, 1.0)),
+            geometry_confidence=geometry_confidence,
+            number_stability=number_stability,
+            numerosity_mean=float(self.number_mean),
+            number_surprise=float(number_surprise),
+        )
+        self.last_spelke = spelke
+        return spelke
 
     def _should_fire(self) -> bool:
         if not self.has_fire_action:
@@ -506,18 +511,6 @@ class CorePriorActiveInferenceAgent:
         if self.frames_without_target > 18:
             return True
         return False
-
-    def _plan_action_code(self, planner_state: np.ndarray, planner_params: dict[str, jnp.float32]) -> tuple[float, float]:
-        self.jax_key, action_code, free_energy = cem_plan(
-            key=self.jax_key,
-            initial_state=jnp.asarray(planner_state, dtype=jnp.float32),
-            params=planner_params,
-            horizon=self.horizon,
-            num_samples=self.num_samples,
-            elite_fraction=self.elite_fraction,
-            iterations=self.iterations,
-        )
-        return float(action_code), float(free_energy)
 
     def _action_code_to_env_action(self, action_code: float) -> int:
         if action_code > 0.5:
@@ -532,7 +525,15 @@ class CorePriorActiveInferenceAgent:
         scene = self.perceptor.extract(observation)
         self._update_tracks(scene)
         self._infer_roles()
-        spelke = self._update_spelke_cores(scene)
+
+        planner_context = self._planner_observation(scene)
+        if planner_context is None:
+            planner_obs = None
+            intercept_error = None
+        else:
+            planner_obs, intercept_error = planner_context
+
+        spelke = self._update_spelke_cores(scene, intercept_error)
 
         target_id = self.target_object_id
         has_target = target_id is not None and target_id in self.objects
@@ -557,11 +558,13 @@ class CorePriorActiveInferenceAgent:
                 number_prior=spelke.number_stability,
                 numerosity_mean=spelke.numerosity_mean,
                 number_surprise=spelke.number_surprise,
+                policy_entropy=0.0,
+                state_entropy=0.0,
+                mean_offset=0.0,
             )
             return self.fire_action, diagnostics
 
-        planner_inputs = self._dynamic_planner_params(scene, spelke)
-        if planner_inputs is None:
+        if planner_obs is None:
             self.last_action_code = 0.0
             diagnostics = AgentDiagnostics(
                 free_energy=0.0,
@@ -575,11 +578,23 @@ class CorePriorActiveInferenceAgent:
                 number_prior=spelke.number_stability,
                 numerosity_mean=spelke.numerosity_mean,
                 number_surprise=spelke.number_surprise,
+                policy_entropy=0.0,
+                state_entropy=0.0,
+                mean_offset=0.0,
             )
             return self.noop_action, diagnostics
 
-        planner_state, planner_params = planner_inputs
-        action_code, free_energy = self._plan_action_code(planner_state, planner_params)
+        action_code, free_energy, policy_entropy, state_entropy, mean_offset = self.aif.step(
+            observation=planner_obs,
+            priors=AIFPriors(
+                object_cohesion=spelke.object_cohesion,
+                agent_intent=spelke.agent_intent,
+                geometry_confidence=spelke.geometry_confidence,
+                number_stability=spelke.number_stability,
+                numerosity_mean=spelke.numerosity_mean,
+                number_surprise=spelke.number_surprise,
+            ),
+        )
         self.last_action_code = action_code
         env_action = self._action_code_to_env_action(action_code)
 
@@ -595,6 +610,9 @@ class CorePriorActiveInferenceAgent:
             number_prior=spelke.number_stability,
             numerosity_mean=spelke.numerosity_mean,
             number_surprise=spelke.number_surprise,
+            policy_entropy=policy_entropy,
+            state_entropy=state_entropy,
+            mean_offset=mean_offset,
         )
         return env_action, diagnostics
 

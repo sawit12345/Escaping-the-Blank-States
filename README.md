@@ -20,10 +20,11 @@ hard-coded to a specific game layout.
 
 - `core_priors_ai/perception.py`: generic object-centric perception with background adaptation,
   foreground segmentation, and connected-component object proposals.
-- `core_priors_ai/planner.py`: JAX expected free-energy dynamics with object/agent/number/geometry
-  prior weights and CEM planning.
+- `core_priors_ai/active_inference.py`: full discrete active inference machinery with explicit
+  likelihood (`A`), transitions (`B`), preferences (`C`), policy priors (`E`), posterior over
+  policies (`q(pi)`), and expected free-energy evaluation.
 - `core_priors_ai/agent.py`: unified Spelke cores driving object tracking, role inference,
-  numerosity belief updates, geometry confidence, and policy execution.
+  numerosity belief updates, geometry confidence, and AIF policy execution.
 - `scripts/run_breakout_experiment.py`: reproducible Breakout evaluation script.
 
 ## Setup
@@ -40,13 +41,11 @@ python scripts/run_breakout_experiment.py --episodes 3 --max-steps 6000
 
 Useful options:
 
-- `--horizon` planning horizon
-- `--num-samples` CEM candidate trajectories
-- `--iterations` CEM update rounds
-- `--elite-fraction` CEM elite ratio
+- `--horizon` active inference policy horizon
 
 Per-episode log includes reward, uncertainty, target tracking, and the four core priors
-(`obj`, `agent`, `geom`, `num`) plus numerosity statistics.
+(`obj`, `agent`, `geom`, `num`) plus numerosity statistics, miss count, policy entropy,
+state entropy, and mean absolute control offset.
 
 ## Notes
 

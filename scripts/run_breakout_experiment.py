@@ -22,11 +22,13 @@ def run_episode(
     max_steps: int,
     seed: int,
     episode_idx: int,
-) -> tuple[float, int, float, float, float, float, float, float, float, float, float]:
+) -> tuple[float, int, int, float, float, float, float, float, float, float, float, float, float, float, float]:
     observation, info = env.reset(seed=seed + episode_idx)
     agent.reset()
 
     total_reward = 0.0
+    misses = 0
+    prev_lives = int(info["lives"]) if "lives" in info else None
     running_efe = 0.0
     running_uncertainty = 0.0
     target_seen_ratio = 0.0
@@ -36,6 +38,9 @@ def run_episode(
     running_number_prior = 0.0
     running_numerosity = 0.0
     running_number_surprise = 0.0
+    running_policy_entropy = 0.0
+    running_state_entropy = 0.0
+    running_mean_offset = 0.0
     step = 0
 
     for step in range(1, max_steps + 1):
@@ -51,6 +56,16 @@ def run_episode(
         running_number_prior += diagnostics.number_prior
         running_numerosity += diagnostics.numerosity_mean
         running_number_surprise += diagnostics.number_surprise
+        running_policy_entropy += diagnostics.policy_entropy
+        running_state_entropy += diagnostics.state_entropy
+        running_mean_offset += abs(diagnostics.mean_offset)
+
+        if "lives" in info:
+            lives = int(info["lives"])
+            if prev_lives is not None and lives < prev_lives:
+                misses += prev_lives - lives
+            prev_lives = lives
+
         agent.observe_transition(info)
 
         if terminated or truncated:
@@ -66,9 +81,13 @@ def run_episode(
     avg_number_prior = running_number_prior / max(steps, 1)
     avg_numerosity = running_numerosity / max(steps, 1)
     avg_number_surprise = running_number_surprise / max(steps, 1)
+    avg_policy_entropy = running_policy_entropy / max(steps, 1)
+    avg_state_entropy = running_state_entropy / max(steps, 1)
+    avg_abs_offset = running_mean_offset / max(steps, 1)
     return (
         total_reward,
         steps,
+        misses,
         avg_efe,
         avg_uncertainty,
         tracked_ratio,
@@ -78,6 +97,9 @@ def run_episode(
         avg_number_prior,
         avg_numerosity,
         avg_number_surprise,
+        avg_policy_entropy,
+        avg_state_entropy,
+        avg_abs_offset,
     )
 
 
@@ -86,7 +108,7 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=6000)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--horizon", type=int, default=10)
+    parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--num-samples", type=int, default=64)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--elite-fraction", type=float, default=0.25)
@@ -113,6 +135,7 @@ def main() -> None:
     )
 
     rewards: list[float] = []
+    misses_all: list[float] = []
     times: list[float] = []
 
     for episode_idx in range(args.episodes):
@@ -120,6 +143,7 @@ def main() -> None:
         (
             reward,
             steps,
+            misses,
             avg_efe,
             avg_uncertainty,
             tracked_ratio,
@@ -129,6 +153,9 @@ def main() -> None:
             avg_number_prior,
             avg_numerosity,
             avg_number_surprise,
+            avg_policy_entropy,
+            avg_state_entropy,
+            avg_abs_offset,
         ) = run_episode(
             env=env,
             agent=agent,
@@ -138,21 +165,26 @@ def main() -> None:
         )
         duration = time.time() - start
         rewards.append(reward)
+        misses_all.append(float(misses))
         times.append(duration)
         print(
             f"episode={episode_idx + 1} reward={reward:.1f} steps={steps} avg_efe={avg_efe:.3f} "
             f"avg_uncertainty={avg_uncertainty:.3f} target_tracked={tracked_ratio:.2%} "
             f"obj={avg_object_prior:.3f} agent={avg_agent_prior:.3f} "
             f"geom={avg_geometry_prior:.3f} num={avg_number_prior:.3f} "
-            f"n_mean={avg_numerosity:.2f} n_surprise={avg_number_surprise:.2f} sec={duration:.2f}"
+            f"n_mean={avg_numerosity:.2f} n_surprise={avg_number_surprise:.2f} "
+            f"pi_H={avg_policy_entropy:.2f} s_H={avg_state_entropy:.2f} |offset|={avg_abs_offset:.2f} "
+            f"misses={misses} sec={duration:.2f}"
         )
 
     rewards_np = np.asarray(rewards, dtype=np.float32)
+    misses_np = np.asarray(misses_all, dtype=np.float32)
     times_np = np.asarray(times, dtype=np.float32)
     print(
         "final "
         f"mean_reward={rewards_np.mean():.3f} std_reward={rewards_np.std():.3f} "
         f"min_reward={rewards_np.min():.3f} max_reward={rewards_np.max():.3f} "
+        f"mean_misses={misses_np.mean():.3f} total_misses={int(misses_np.sum())} "
         f"mean_sec={times_np.mean():.2f}"
     )
 
